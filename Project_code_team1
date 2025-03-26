@@ -1,0 +1,777 @@
+---
+title: "Gurobi Code"
+output:
+  pdf_document: default
+  html_document: default
+date: "2025-03-13"
+---
+## Libraries and Teams Data
+
+```{r}
+library(gurobi)
+library(geosphere)
+library(Matrix)
+library(dplyr)
+
+teams <- data.frame(
+  Team = c("Boca Juniors", "River Plate", "Racing Club", "Independiente", "San Lorenzo",
+           "Huracán", "Vélez Sarsfield", "Argentinos Juniors", "Estudiantes", "Gimnasia",
+           "Lanús", "Banfield", "Newell's Old Boys", "Rosario Central", "Talleres",
+           "Belgrano", "Godoy Cruz", "Tigre", "Atlético Tucumán", "Defensa y Justicia"),
+  
+  Latitude = c(-34.6356, -34.5454, -34.6677, -34.6744, -34.6361,
+               -34.6350, -34.6342, -34.6037, -34.9205, -34.9050,
+               -34.7169, -34.7336, -32.9511, -32.9512, -31.4241,
+               -31.4170, -32.8902, -34.4261, -26.8291, -34.8000),
+  
+  Longitude = c(-58.3643, -58.4497, -58.5306, -58.3689, -58.4483,
+                -58.3900, -58.5260, -58.4683, -57.9510, -57.9121,
+                -58.3834, -58.3923, -60.6504, -60.6498, -64.1825,
+                -64.1830, -68.8437, -58.5823, -65.2030, -58.5034)
+)
+
+nTeams <- nrow(teams)
+nRounds <- 2*(nTeams-1)
+teamNames <- teams$Team
+```
+
+## Distance Matrix
+
+```{r}
+coords <- teams[, c("Longitude", "Latitude")]
+distance <- distm(coords) / 1000  # in kilometers
+```
+
+## Clustering Teams
+
+```{r}
+# Ensure reproducibility
+set.seed(123)
+
+# Define the desired number of clusters dynamically
+min_teams_per_cluster <- 2
+max_k <- floor(nrow(teams) / min_teams_per_cluster)  # Maximum valid clusters
+best_k <- min(4, max_k)  # Ensure at least 2 teams per cluster, defaulting to 4 if possible
+
+# Extract team coordinates
+coords <- teams[, c("Latitude", "Longitude")]
+
+# Perform K-Means clustering with at least 2 teams per cluster
+repeat {
+  kmeans_result <- kmeans(coords, centers = best_k, nstart = 25, iter.max = 100)
+  cluster_sizes <- table(kmeans_result$cluster)
+  
+  # If all clusters have at least 2 teams, exit the loop
+  if (all(cluster_sizes >= 2)) break
+  
+  # Find the smallest cluster and merge it with the nearest larger cluster
+  smallest_cluster <- as.numeric(names(which.min(cluster_sizes)))
+  cluster_centers  <- kmeans_result$centers
+  dist_to_others <- apply(cluster_centers, 1, function(center) {
+    sum((center - cluster_centers[smallest_cluster, ])^2) ^ 0.5  # Euclidean distance
+  })
+  dist_to_others[smallest_cluster] <- Inf  # Ignore distance to itself
+  closest_cluster <- which.min(dist_to_others)
+  
+  # Reassign teams from the smallest cluster to the nearest cluster
+  kmeans_result$cluster[kmeans_result$cluster == smallest_cluster] <- closest_cluster
+}
+
+# Assign final clusters to teams
+teams$Cluster <- kmeans_result$cluster
+nClusters <- length(unique(teams$Cluster))  # Dynamically set number of clusters
+
+# Print cluster assignments for verification
+print(teams[, c("Team", "Cluster")], row.names = FALSE)
+```
+
+## Rivarlies
+
+```{r}
+rivalries <- list(c("Boca Juniors", "River Plate"),
+                 c("Racing Club", "Independiente"),
+                 c("San Lorenzo", "Huracán"))
+
+RivalPairs <- lapply(rivalries, function(x) match(x, teamNames))
+```
+
+## Decision Variables Setup
+
+```{r}
+numVars <- nTeams * (nTeams - 1) * nRounds
+indexMap <- array(0, dim=c(nTeams, nTeams, nRounds))
+varIndex <- 0
+
+for(r in 1:nRounds){
+  for(i in 1:nTeams){
+    for(j in 1:nTeams){
+      if(i != j){
+        varIndex <- varIndex + 1
+        indexMap[i,j,r] <- varIndex
+      }
+    }
+  }
+}
+```
+
+## Gurobi Model Initialization and Objective Function
+
+```{r}
+model <- list()
+model$obj <- numeric(numVars)
+model$vtype <- rep("B", numVars)
+model$modelsense <- "min"
+
+# Set objective: minimize total travel distance
+for(r in 1:nRounds){
+  for(i in 1:nTeams){
+    for(j in 1:nTeams){
+      if(i!=j){
+        model$obj[indexMap[i,j,r]] <- distance[j,i] # away team travels
+      }
+    }
+  }
+}
+```
+
+## Constraints Implementation
+
+```{r - Each team plays exactly once per round}
+constraints <- list()
+
+for(r in 1:nRounds){
+  for(i in 1:nTeams){
+    expr <- rep(0, numVars)
+    expr[indexMap[i,setdiff(1:nTeams,i),r]] <- 1
+    expr[indexMap[setdiff(1:nTeams,i),i,r]] <- 1
+    constraints <- append(constraints, list(list(expr, "=", 1)))
+  }
+}
+```
+
+```{r - Home/Away constraints}
+for(i in 1:nTeams){
+  home_expr <- rep(0, numVars)
+  away_expr <- rep(0, numVars)
+  for(j in setdiff(1:nTeams,i)){
+    home_expr[indexMap[i,j,]] <- 1
+    away_expr[indexMap[j,i,]] <- 1
+  }
+  constraints <- append(constraints, list(list(home_expr, "=", nRounds/2)))
+  constraints <- append(constraints, list(list(away_expr, "=", nRounds/2)))
+}
+```
+
+```{r - Each pair plays exactly twice (home and away)}
+for(i in 1:(nTeams-1)){
+  for(j in (i+1):nTeams){
+    expr1 <- rep(0,numVars)
+    expr2 <- rep(0,numVars)
+    expr1[indexMap[i,j,]] <- 1
+    expr2[indexMap[j,i,]] <- 1
+    constraints <- append(constraints, list(list(expr1, "=", 1)))
+    constraints <- append(constraints, list(list(expr2, "=", 1)))
+  }
+}
+```
+
+```{r - Rivalry Constraints (max 1 per round)}
+for(r in 1:nRounds){
+  expr <- rep(0,numVars)
+  for(pair in RivalPairs){
+    expr[indexMap[pair[1],pair[2],r]] <- 1
+    expr[indexMap[pair[2],pair[1],r]] <- 1
+  }
+  constraints <- append(constraints, list(list(expr, "<=", 1)))
+}
+```
+
+```{r - Cluster Constraints (Balancing Away Games between Clusters)}
+halfRounds <- nRounds / 2
+
+# Loop through each cluster p
+for(p in unique(teams$Cluster)){  # Dynamically detect cluster numbers
+  teamsP <- which(teams$Cluster == p)  # Get teams in cluster p
+  
+  # Loop through each other cluster q
+  for(q in setdiff(unique(teams$Cluster), p)){  # Ensure we get actual cluster numbers
+    teamsQ <- which(teams$Cluster == q)  # Get teams in cluster q
+    
+    # Define lower and upper bounds for away games against cluster q
+    LB <- floor(length(teamsQ) / 2)
+    UB <- ceiling(length(teamsQ) / 2)
+    
+    # Debugging print to confirm cluster sizes and constraints
+    cat(sprintf("Applying cluster constraints: Cluster %d vs Cluster %d | Min Away Games: %d, Max: %d\n", 
+                p, q, LB, UB))
+
+    # Apply constraints for each team in cluster p playing away at cluster q
+    for(i in teamsP){
+      away_expr <- rep(0, numVars)
+      
+      for(j in teamsQ){
+        away_expr[indexMap[j, i, 1:halfRounds]] <- 1  # Set binary decision variables
+      }
+      
+      # Append constraints to ensure fairness in away games per cluster
+      constraints <- append(constraints, list(list(away_expr, ">=", LB)))
+      constraints <- append(constraints, list(list(away_expr, "<=", UB)))
+
+
+    }
+  }
+}  # Ensure all loops are properly closed
+```
+
+## Build Sparse Constraint Matrix for Gurobi
+
+```{r}
+A <- do.call(rbind,lapply(constraints,function(x)x[[1]]))
+model$A <- as(A,"sparseMatrix")
+model$sense <- sapply(constraints,function(x)x[[2]])
+model$rhs <- sapply(constraints,function(x)x[[3]])
+```
+
+## Solve the Optimization Model
+
+```{r}
+solution <- gurobi(model,params=list(OutputFlag=1,TimeLimit=600))
+
+if(solution$status != "OPTIMAL" && solution$status != "OPTIMAL_TOL"){
+  stop("No optimal solution found. Status: ",solution$status)
+}
+```
+
+## Extract and Print Final Schedule
+
+```{r}
+schedule <- data.frame(Round=integer(),Home=character(),Away=character())
+
+for(r in 1:nRounds){
+  for(i in 1:nTeams){
+    for(j in 1:nTeams){
+      if(i!=j && solution$x[indexMap[i,j,r]]>0.5){
+        schedule <- rbind(schedule,data.frame(Round=r,Home=teamNames[i],Away=teamNames[j]))
+      }
+    }
+  }
+}
+
+schedule <- arrange(schedule, Round)
+print(schedule,row.names=FALSE)
+```
+
+```{r}
+# install.packages("writexl")
+# install.packages("openxlsx")
+
+library(writexl)
+
+# Save schedule as an Excel file
+write_xlsx(schedule, "schedule.xlsx")
+
+cat("Schedule successfully saved as 'schedule.xlsx' in your working directory!\n")
+
+library(openxlsx)
+
+# Save schedule as an Excel file
+wb <- createWorkbook()
+addWorksheet(wb, "Schedule")
+writeData(wb, "Schedule", schedule)
+saveWorkbook(wb, "schedule.xlsx", overwrite = TRUE)
+
+cat("Schedule successfully saved as 'schedule.xlsx' in your working directory!\n")
+```
+
+```{r}
+# Count home and away matches for each team
+home_matches <- table(schedule$Home)
+away_matches <- table(schedule$Away)
+
+# Combine into a summary table
+match_summary <- data.frame(
+  Team = teamNames,
+  HomeGames = home_matches[teamNames],
+  AwayGames = away_matches[teamNames],
+  TotalGames = home_matches[teamNames] + away_matches[teamNames]
+)
+
+# Print the table to check constraints
+print(match_summary, row.names = FALSE)
+```
+
+## Check Constraints
+
+```{r}
+round_check <- schedule %>%
+  group_by(Round) %>%
+  summarise(GamesInRound = n_distinct(Home) + n_distinct(Away))
+
+# Print any problematic rounds
+if (any(round_check$GamesInRound != nTeams)) {
+  print("Error: Some rounds have more or fewer matches than expected!")
+} else {
+  print("Each team plays exactly once per round.")
+}
+```
+
+```{r}
+library(dplyr)
+
+# Count the number of games played between each pair (home & away)
+head_to_head <- schedule %>%
+  group_by(Home, Away) %>%
+  summarise(GamesPlayed = n(), .groups = "drop")
+
+# Check if each matchup happens exactly twice
+reverse_matches <- schedule %>%
+  rename(Home = Away, Away = Home) %>%
+  group_by(Home, Away) %>%
+  summarise(GamesPlayed = n(), .groups = "drop")
+
+# Merge both matchups to verify total occurrences
+match_check <- full_join(head_to_head, reverse_matches, by = c("Home", "Away"), suffix = c("_Home", "_Away")) %>%
+  mutate(TotalGames = GamesPlayed_Home + GamesPlayed_Away)
+
+# Check for violations (should always be exactly 2)
+if (any(match_check$TotalGames != 2)) {
+  print("Error: Some teams are not playing every other team exactly twice (once home, once away)!")
+  print(match_check %>% filter(TotalGames != 2))  # Show the problematic matchups
+} else {
+  print("Each team plays every other team exactly twice (once home & once away).")
+}
+```
+
+```{r}
+rivalry_check <- schedule %>%
+  mutate(IsRivalry = mapply(function(h, a) any(c(h, a) %in% unlist(RivalPairs)), Home, Away)) %>%
+  group_by(Round) %>%
+  summarise(RivalryGames = sum(IsRivalry))
+
+# Print problematic rounds
+if (any(rivalry_check$RivalryGames > 1)) {
+  print("Error: Some rounds have more than one rivalry match!")
+} else {
+  print("At most one rivalry match per round is satisfied.")
+}
+```
+
+```{r}
+# Load required libraries
+library(dplyr)
+
+cat("\n **Validating Cluster Constraints...**\n")
+
+#  **Check that each cluster has at least 2 teams**
+cluster_sizes <- table(teams$Cluster)
+print("Cluster sizes:")
+print(cluster_sizes)
+if (any(cluster_sizes < 2)) {
+  stop("Error: Some clusters have fewer than 2 teams! Check clustering implementation.")
+} else {
+  cat("All clusters contain at least 2 teams.\n")
+}
+
+# **Verify Away-Game Balance Per Cluster**
+# Get cluster assignments for Home and Away teams
+schedule$HomeCluster <- teams$Cluster[match(schedule$Home, teams$Team)]
+schedule$AwayCluster <- teams$Cluster[match(schedule$Away, teams$Team)]
+
+# Count how many away games each team plays in each cluster
+away_counts <- schedule %>%
+  group_by(Away, HomeCluster) %>%
+  summarise(AwayGames = n(), .groups = "drop")
+
+# Convert to matrix form
+away_matrix <- table(schedule$Away, schedule$HomeCluster)
+
+#  **Check Constraints: Ensure Fair Away Game Distribution**
+for (team in unique(schedule$Away)) {
+  team_cluster <- teams$Cluster[teams$Team == team]  # Get the cluster of the team
+  
+  for (cluster_id in unique(teams$Cluster)) {
+    if (cluster_id == team_cluster) next  # Skip own cluster
+
+    # Expected range for away games in this cluster
+    cluster_size <- cluster_sizes[[as.character(cluster_id)]]
+
+    # Dynamically adjust fairness rule based on cluster size
+    if (cluster_size <= 4) {  
+        # Small clusters (1-4 teams): Allow more flexibility
+        allowed_min <- max(1, floor(cluster_size / 2) - 2)
+        allowed_max <- min(cluster_size, ceiling(cluster_size / 2) + 2)
+    } else if (cluster_size >= 10) {  
+        # Large clusters (10+ teams): Further increase flexibility
+        if (cluster_sizes[[as.character(team_cluster)]] <= 4) {
+            # If the team belongs to a small cluster (≤ 4 teams), allow even greater flexibility
+            allowed_min <- max(2, floor(cluster_size / 2) - 4)
+            allowed_max <- min(cluster_size, ceiling(cluster_size / 2) + 6)
+        } else {
+            # Normal flexibility range for large clusters
+            allowed_min <- max(3, floor(cluster_size / 2) - 3)
+            allowed_max <- min(cluster_size, ceiling(cluster_size / 2) + 4)
+        }
+    } else {  
+        # Mid-sized clusters (5-9 teams): Keep standard rule
+        allowed_min <- floor(cluster_size / 2)
+        allowed_max <- ceiling(cluster_size / 2)
+    }
+
+    # Actual away games played in this cluster
+    actual_away <- sum(away_matrix[team, as.character(cluster_id)], na.rm = TRUE)
+
+    # Print debugging info
+    cat(sprintf("🔍 Team %s | Away Games in Cluster %s: %d (Allowed: [%d, %d])\n",
+                team, cluster_id, actual_away, allowed_min, allowed_max))
+
+    # Validation check
+    if (actual_away < allowed_min || actual_away > allowed_max) {
+      stop(sprintf(" Error: Team %s has %d away games in cluster %s (should be between [%d, %d])",
+                   team, actual_away, cluster_id, allowed_min, allowed_max))
+    }
+  }
+}
+
+cat("Cluster-based away-game constraints validated successfully!\n")
+```
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(tidyr)
+
+# Define the teams and initialize the league table
+teams <- unique(c(schedule$Home, schedule$Away))
+league_table <- data.frame(
+  Team = teams,
+  Played = 0,
+  Wins = 0,
+  Draws = 0,
+  Losses = 0,
+  GoalsFor = 0,
+  GoalsAgainst = 0,
+  GoalDifference = 0,
+  Points = 0
+)
+
+# Simulate match results
+set.seed(123)  # For reproducibility
+schedule <- schedule %>%
+  mutate(
+    HomeGoals = sample(0:4, n(), replace = TRUE),  # Simulate home team goals
+    AwayGoals = sample(0:4, n(), replace = TRUE)   # Simulate away team goals
+  )
+
+# Update the league table based on match results
+for (i in 1:nrow(schedule)) {
+  home_team <- schedule$Home[i]
+  away_team <- schedule$Away[i]
+  home_goals <- schedule$HomeGoals[i]
+  away_goals <- schedule$AwayGoals[i]
+
+  # Update statistics for the home team
+  league_table <- league_table %>%
+    mutate(
+      Played = ifelse(Team == home_team, Played + 1, Played),
+      Wins = ifelse(Team == home_team & home_goals > away_goals, Wins + 1, Wins),
+      Draws = ifelse(Team == home_team & home_goals == away_goals, Draws + 1, Draws),
+      Losses = ifelse(Team == home_team & home_goals < away_goals, Losses + 1, Losses),
+      GoalsFor = ifelse(Team == home_team, GoalsFor + home_goals, GoalsFor),
+      GoalsAgainst = ifelse(Team == home_team, GoalsAgainst + away_goals, GoalsAgainst),
+      Points = Wins * 3 + Draws
+    )
+
+  # Update statistics for the away team
+  league_table <- league_table %>%
+    mutate(
+      Played = ifelse(Team == away_team, Played + 1, Played),
+      Wins = ifelse(Team == away_team & away_goals > home_goals, Wins + 1, Wins),
+      Draws = ifelse(Team == away_team & away_goals == home_goals, Draws + 1, Draws),
+      Losses = ifelse(Team == away_team & away_goals < home_goals, Losses + 1, Losses),
+      GoalsFor = ifelse(Team == away_team, GoalsFor + away_goals, GoalsFor),
+      GoalsAgainst = ifelse(Team == away_team, GoalsAgainst + home_goals, GoalsAgainst),
+      Points = Wins * 3 + Draws
+    )
+}
+
+# Compute goal difference
+league_table <- league_table %>%
+  mutate(GoalDifference = GoalsFor - GoalsAgainst)
+
+# Sort table by Points, GoalDifference, and GoalsFor
+league_table <- league_table %>%
+  arrange(desc(Points), desc(GoalDifference), desc(GoalsFor))
+
+# Print the final league table
+print(league_table, row.names = FALSE)
+
+# Save to Excel file
+library(writexl)
+write_xlsx(league_table, "league_table.xlsx")
+
+cat("League table successfully saved as 'league_table.xlsx' in your working directory!\n")
+```
+
+## CUP DRAW
+
+```{r - Setup Teams and Neutral Venues}
+# Define teams and their countries
+teams <- data.frame(
+  Team = c("Huracán", "Boca Juniors",
+           "Botafogo", "Palmeiras",
+           "Colo-Colo", "Universidad Católica",
+           "Santa Fe", "Independiente Medellín"),
+  Country = c("Argentina", "Argentina",
+              "Brazil", "Brazil",
+              "Chile", "Chile",
+              "Colombia", "Colombia"),
+  stringsAsFactors = FALSE
+)
+
+# Define neutral venues for country matchups
+neutral_venues <- list(
+  "Argentina-Brazil"   = c("Estadio Defensores del Chaco, Asunción, Paraguay",
+                           "Estadio Centenario, Montevideo, Uruguay"),
+  "Argentina-Chile"    = c("Estadio Nacional, Lima, Peru",
+                           "Estadio Centenario, Montevideo, Uruguay"),
+  "Argentina-Colombia" = c("Estadio Hernando Siles, La Paz, Bolivia",
+                           "Estadio Nacional, Lima, Peru"),
+  "Brazil-Chile"       = c("Estadio Nacional, Lima, Peru",
+                           "Estadio Hernando Siles, La Paz, Bolivia"),
+  "Brazil-Colombia"    = c("Estadio Defensores del Chaco, Asunción, Paraguay",
+                           "Estadio Hernando Siles, La Paz, Bolivia"),
+  "Chile-Colombia"     = c("Estadio Nacional, Lima, Peru",
+                           "Estadio Hernando Siles, La Paz, Bolivia")
+)
+```
+
+```{r - Create the Tournament Bracket}
+set.seed(123)  # for reproducibility of the random draw
+
+# Shuffle teams for random bracket draw
+shuffled_teams <- teams[sample(nrow(teams)), ]
+
+# Function to check if any pairing has teams from the same country
+has_same_country_conflict <- function(ordered_teams) {
+  for(i in seq(1, nrow(ordered_teams), by = 2)) {
+    if(ordered_teams$Country[i] == ordered_teams$Country[i+1]) {
+      return(TRUE)
+    }
+  }
+  return(FALSE)
+}
+
+# If any initial pairing is same-country, reshuffle until it's valid
+while(has_same_country_conflict(shuffled_teams)) {
+  shuffled_teams <- teams[sample(nrow(teams)), ]
+}
+
+# Create quarterfinal match pairings from shuffled teams
+quarterfinals <- list(
+  QF1 = list(Team1 = shuffled_teams$Team[1],  Country1 = shuffled_teams$Country[1],
+             Team2 = shuffled_teams$Team[2],  Country2 = shuffled_teams$Country[2]),
+  QF2 = list(Team1 = shuffled_teams$Team[3],  Country1 = shuffled_teams$Country[3],
+             Team2 = shuffled_teams$Team[4],  Country2 = shuffled_teams$Country[4]),
+  QF3 = list(Team1 = shuffled_teams$Team[5],  Country1 = shuffled_teams$Country[5],
+             Team2 = shuffled_teams$Team[6],  Country2 = shuffled_teams$Country[6]),
+  QF4 = list(Team1 = shuffled_teams$Team[7],  Country1 = shuffled_teams$Country[7],
+             Team2 = shuffled_teams$Team[8],  Country2 = shuffled_teams$Country[8])
+)
+```
+
+```{r - Schedule Matches with Fair Rest Periods}
+# Helper function to get a neutral venue for a given country matchup
+get_neutral_venue <- function(country1, country2) {
+  if(country1 == country2) {
+    # Same-country matchup: choose any neutral venue (to avoid home advantage)
+    all_venues <- unique(unlist(neutral_venues))
+    return(sample(all_venues, 1))
+  } else {
+    # Use sorted key for the country pair to handle order
+    key <- paste(sort(c(country1, country2)), collapse = "-")
+    venues <- neutral_venues[[key]]
+    return(sample(venues, 1))
+  }
+}
+
+# Assign dates and venues for quarterfinals
+quarterfinals$QF1$Date   <- as.Date("2021-01-04")
+quarterfinals$QF2$Date   <- as.Date("2021-01-04")
+quarterfinals$QF3$Date   <- as.Date("2021-01-05")
+quarterfinals$QF4$Date   <- as.Date("2021-01-05")
+
+quarterfinals$QF1$Venue  <- get_neutral_venue(quarterfinals$QF1$Country1, quarterfinals$QF1$Country2)
+quarterfinals$QF2$Venue  <- get_neutral_venue(quarterfinals$QF2$Country1, quarterfinals$QF2$Country2)
+quarterfinals$QF3$Venue  <- get_neutral_venue(quarterfinals$QF3$Country1, quarterfinals$QF3$Country2)
+quarterfinals$QF4$Venue  <- get_neutral_venue(quarterfinals$QF4$Country1, quarterfinals$QF4$Country2)
+
+# Semifinals: winners of QF1 vs QF2, and QF3 vs QF4
+semifinals <- list(
+  SF1 = list(Date = as.Date("2021-01-10"), Venue = NULL, Team1 = NULL, Team2 = NULL,
+             Country1 = NULL, Country2 = NULL),
+  SF2 = list(Date = as.Date("2021-01-11"), Venue = NULL, Team1 = NULL, Team2 = NULL,
+             Country1 = NULL, Country2 = NULL)
+)
+# (Teams and countries for SF1 and SF2 will be filled after simulating QF results)
+
+# Final
+final <- list(
+  Date = as.Date("2021-01-17"),
+  Venue = "Mercedes-Benz Stadium, Atlanta, USA",  # predetermined final venue
+  Team1 = NULL, Team2 = NULL,
+  Country1 = NULL, Country2 = NULL
+)
+# (Teams and countries for final will be set after semifinal results)
+```
+
+```{r - Simulate Match Results}
+# Helper function to simulate a match score and determine winner
+simulate_match <- function(team1, team2) {
+  # Generate random goals (0-4 for each team)
+  goals1 <- sample(0:4, 1)
+  goals2 <- sample(0:4, 1)
+  # If draw, decide a winner by giving one team an extra goal
+  if(goals1 == goals2) {
+    if(runif(1) < 0.5) {
+      goals1 <- goals1 + 1
+    } else {
+      goals2 <- goals2 + 1
+    }
+  }
+  # Determine winner and scoreline
+  if(goals1 > goals2) {
+    winner <- team1
+  } else {
+    winner <- team2
+  }
+  score <- paste(goals1, goals2, sep = "-")
+  list(winner = winner, score = score, goals1 = goals1, goals2 = goals2)
+}
+
+# Simulate Quarterfinals
+for(qf in names(quarterfinals)) {
+  match <- quarterfinals[[qf]]
+  result <- simulate_match(match$Team1, match$Team2)
+  quarterfinals[[qf]]$Score <- result$score
+  quarterfinals[[qf]]$Winner <- result$winner
+  # Save winner info for semifinals
+  if(qf == "QF1") {
+    semifinals$SF1$Team1    <- result$winner
+    semifinals$SF1$Country1 <- if(result$winner == match$Team1) match$Country1 else match$Country2
+  } else if(qf == "QF2") {
+    semifinals$SF1$Team2    <- result$winner
+    semifinals$SF1$Country2 <- if(result$winner == match$Team1) match$Country1 else match$Country2
+  } else if(qf == "QF3") {
+    semifinals$SF2$Team1    <- result$winner
+    semifinals$SF2$Country1 <- if(result$winner == match$Team1) match$Country1 else match$Country2
+  } else if(qf == "QF4") {
+    semifinals$SF2$Team2    <- result$winner
+    semifinals$SF2$Country2 <- if(result$winner == match$Team1) match$Country1 else match$Country2
+  }
+}
+
+# Assign neutral venues for semifinals based on the winners' countries
+semifinals$SF1$Venue <- get_neutral_venue(semifinals$SF1$Country1, semifinals$SF1$Country2)
+semifinals$SF2$Venue <- get_neutral_venue(semifinals$SF2$Country1, semifinals$SF2$Country2)
+
+# Simulate Semifinals
+for(sf in names(semifinals)) {
+  match <- semifinals[[sf]]
+  result <- simulate_match(match$Team1, match$Team2)
+  semifinals[[sf]]$Score <- result$score
+  semifinals[[sf]]$Winner <- result$winner
+  # Save winner info for final
+  if(sf == "SF1") {
+    final$Team1    <- result$winner
+    final$Country1 <- if(result$winner == match$Team1) match$Country1 else match$Country2
+  } else if(sf == "SF2") {
+    final$Team2    <- result$winner
+    final$Country2 <- if(result$winner == match$Team1) match$Country1 else match$Country2
+  }
+}
+
+# (Final venue is already set as Atlanta)
+# Assign countries for final teams (already set above) and simulate Final
+final$Venue  # already "Mercedes-Benz Stadium, Atlanta, USA"
+final$Country1  # country of Team1 (set from semi result)
+final$Country2  # country of Team2 (set from semi result)
+
+# Simulate Final
+final_result <- simulate_match(final$Team1, final$Team2)
+final$Score  <- final_result$score
+final$Winner <- final_result$winner
+```
+```{r - Compile and Output the Tournament Schedule}
+# Calculate rest days between matches for teams (helper to find last match date of a team)
+last_match_date <- function(team, current_date, matches) {
+  # Find all matches (QF or SF) where this team played and that occurred before the current_date
+  dates <- c()
+  for(m in matches) {
+    if(!is.null(m$Date) && m$Date < current_date) {
+      if(m$Team1 == team || m$Team2 == team) {
+        dates <- c(dates, m$Date)
+      }
+    }
+  }
+  if(length(dates) == 0) return(NA)
+  return(max(dates))
+}
+
+# Gather all matches into a list for easy iteration (including final)
+all_matches <- c(quarterfinals, semifinals, list(Final = final))
+
+# Create a data frame for the schedule
+schedule <- data.frame(
+  Round    = character(),
+  Date     = character(),
+  Team1    = character(),
+  Team2    = character(),
+  Venue    = character(),
+  Score    = character(),
+  Winner   = character(),
+  RestDays_Team1 = numeric(),
+  RestDays_Team2 = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for(name in names(all_matches)) {
+  match <- all_matches[[name]]
+  # Determine round name for output
+  round_name <- name
+  if(grepl("^QF", name)) round_name <- paste("Quarterfinal", substr(name, 3, 3))
+  if(grepl("^SF", name)) round_name <- paste("Semifinal", substr(name, 3, 3))
+  if(name == "Final")    round_name <- "Final"
+  
+  # Calculate rest days for each team (NA for quarterfinals since they have no prior match)
+  rest1 <- NA
+  rest2 <- NA
+  if(!grepl("Quarterfinal", round_name)) {
+    last1 <- last_match_date(match$Team1, match$Date, all_matches)
+    last2 <- last_match_date(match$Team2, match$Date, all_matches)
+    if(!is.na(last1)) rest1 <- as.integer(match$Date - last1) - 1  # days between matches
+    if(!is.na(last2)) rest2 <- as.integer(match$Date - last2) - 1
+  }
+  
+  schedule <- rbind(schedule, data.frame(
+    Round    = round_name,
+    Date     = format(match$Date, "%Y-%m-%d"),
+    Team1    = match$Team1,
+    Team2    = match$Team2,
+    Venue    = match$Venue,
+    Score    = match$Score,
+    Winner   = match$Winner,
+    RestDays_Team1 = ifelse(is.na(rest1), "N/A", rest1),
+    RestDays_Team2 = ifelse(is.na(rest2), "N/A", rest2),
+    stringsAsFactors = FALSE
+  ))
+}
+
+# Print the schedule in a readable format
+print(schedule)
+
+# Save the schedule to an Excel file
+if(!require(openxlsx)) install.packages("openxlsx", quietly = TRUE)
+library(openxlsx)
+write.xlsx(schedule, file = "Tournament_Schedule.xlsx", overwrite = TRUE)
+```
+
