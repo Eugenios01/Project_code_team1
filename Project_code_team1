@@ -8,27 +8,148 @@ date: "2025-03-13"
 ## Libraries and Teams Data
 
 ```{r}
-library(gurobi)
+# library(gurobi)
 library(geosphere)
 library(Matrix)
 library(dplyr)
 
+############ Argentina: ############
+
 teams <- data.frame(
+
   Team = c("Boca Juniors", "River Plate", "Racing Club", "Independiente", "San Lorenzo",
+
            "Huracán", "Vélez Sarsfield", "Argentinos Juniors", "Estudiantes", "Gimnasia",
+
            "Lanús", "Banfield", "Newell's Old Boys", "Rosario Central", "Talleres",
+
            "Belgrano", "Godoy Cruz", "Tigre", "Atlético Tucumán", "Defensa y Justicia"),
-  
+
+
+
   Latitude = c(-34.6356, -34.5454, -34.6677, -34.6744, -34.6361,
+
                -34.6350, -34.6342, -34.6037, -34.9205, -34.9050,
+
                -34.7169, -34.7336, -32.9511, -32.9512, -31.4241,
+
                -31.4170, -32.8902, -34.4261, -26.8291, -34.8000),
-  
+
+
+
   Longitude = c(-58.3643, -58.4497, -58.5306, -58.3689, -58.4483,
+
                 -58.3900, -58.5260, -58.4683, -57.9510, -57.9121,
+
                 -58.3834, -58.3923, -60.6504, -60.6498, -64.1825,
-                -64.1830, -68.8437, -58.5823, -65.2030, -58.5034)
-)
+
+                -64.1830, -68.8437, -58.5823, -65.2030, -58.5034
+
+))
+
+
+############ Colombia:  ##################
+
+# teams <- data.frame(
+# 
+#   Team = c("Alianza Petrolera", "América de Cali", "Atlético Bucaramanga", "Atlético Huila", "Atlético Nacional",
+# 
+#            "Cúcuta Deportivo", "Deportes Tolima", "Deportivo Cali", "Deportivo Pasto", "Envigado",
+# 
+#            "Independiente Medellín", "Jaguares de Córdoba", "Junior", "La Equidad", "Millonarios",
+# 
+#            "Once Caldas", "Patriotas Boyacá", "Rionegro Águilas", "Santa Fe", "Unión Magdalena"),
+# 
+#  
+# 
+#   Latitude = c(7.0653, 3.4216, 7.1139, 2.9273, 6.2569,
+# 
+#                7.8939, 4.4389, 3.3753, 0.8250, 6.1683,
+# 
+#                6.2569, 8.7479, 10.9187, 4.6256, 4.6461,
+# 
+#                5.0631, 5.5446, 6.1553, 4.6461, 11.2325),
+# 
+#  
+# 
+#   Longitude = c(-73.8546, -76.5358, -73.1258, -75.2819, -75.5906,
+# 
+#                 -72.5078, -75.1997, -76.4847, -77.6440, -75.5836,
+# 
+#                 -75.5906, -75.8784, -74.8019, -74.0839, -74.0775,
+# 
+#                 -75.4847, -73.3678, -75.3792, -74.0775, -74.1979)
+# 
+# )
+
+ 
+
+############ Brazil:############ 
+# 
+# teams <- data.frame(
+# 
+#   Team = c("Athletico Paranaense", "Atlético Goianiense", "Atlético Mineiro", "Bahia",
+# 
+#            "Botafogo", "Ceará", "Corinthians", "Coritiba", "Flamengo", "Fluminense",
+# 
+#            "Fortaleza", "Goiás", "Grêmio", "Internacional", "Palmeiras", "Red Bull Bragantino",
+# 
+#            "Santos", "São Paulo", "Sport Recife", "Vasco da Gama"),
+# 
+#  
+# 
+#   Latitude = c(-25.4485, -16.6654, -19.8659, -12.9714, -22.9006, -3.8122, -23.5450, -25.4185,
+# 
+#                -22.9121, -22.9121, -3.8122, -16.6666, -30.0591, -30.0650, -23.5273, -22.9501,
+# 
+#                -23.9648, -23.5980, -8.0620, -22.8908),
+# 
+#  
+# 
+#   Longitude = c(-49.2769, -49.2642, -43.9705, -38.5014, -43.2325, -38.5218, -46.4741, -49.2652,
+# 
+#                 -43.2302, -43.2302, -38.5218, -49.2641, -51.2351, -51.2359, -46.6780, -46.5341,
+# 
+#                 -46.3280, -46.7182, -34.9039, -43.2283)
+# 
+# )
+
+############ Chile: ############ 
+# 
+# teams <- data.frame(
+# 
+#   Team = c("Audax Italiano", "Cobresal", "Colo-Colo", "Coquimbo Unido", "Curicó Unido",
+# 
+#            "Deportes Antofagasta", "Deportes Iquique", "Everton", "Huachipato", "O'Higgins",
+# 
+#            "Palestino", "Unión Española", "Unión La Calera", "Universidad Católica",
+# 
+#            "Universidad de Chile", "Universidad de Concepción"),
+# 
+#  
+# 
+#   Latitude = c(-33.522, -26.024, -33.496, -29.953, -34.982,
+# 
+#                -23.652, -20.216, -33.015, -36.724, -34.170,
+# 
+#                -33.514, -33.419, -32.787, -33.403,
+# 
+#                -33.456, -36.827),
+# 
+#  
+# 
+#   Longitude = c(-70.611, -69.616, -70.610, -71.338, -71.232,
+# 
+#                 -70.395, -70.139, -71.550, -73.116, -70.741,
+# 
+#                 -70.664, -70.664, -71.196, -70.508,
+# 
+#                 -70.605, -73.050)
+# 
+# )
+
+
+
 
 nTeams <- nrow(teams)
 nRounds <- 2*(nTeams-1)
